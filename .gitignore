@@ -1,0 +1,5 @@
+# Machine-specific, written by -Setup on each machine
+audiobook-sync.config.json
+
+# Runtime output
+audiobook-sync.log
