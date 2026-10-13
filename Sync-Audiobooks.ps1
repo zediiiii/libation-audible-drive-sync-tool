@@ -144,6 +144,103 @@ function Strip-LongPath {
 }
 
 # ==================================================================
+# Library index
+#
+# New Libation downloads land at  <root>\<Author>\<Series>\  with no
+# category attached. Two signals say where they belong:
+#
+#   SERIES - if that author already has that series filed somewhere, the
+#            new books belong there too. Treated as authoritative.
+#   AUTHOR - if the author is known but the series is new, the author's
+#            usual category is only a SUGGESTION. Authors legitimately
+#            span categories (Drew Hayes writes both YA and adult), so
+#            this never decides on its own.
+# ==================================================================
+
+# Normalise a folder name for comparison: lower-case, then strip every
+# non-alphanumeric character outright. That absorbs the differences that
+# actually occur between downloads - case, punctuation, spacing, and the
+# full-width characters Libation substitutes for Windows-illegal ones
+# (U+FF1F for "?", etc).
+#
+# Stripping rather than collapsing to a space matters: "J.K. Rowling"
+# collapsed becomes "j k rowling" but "JK Rowling" becomes "jk rowling",
+# and the two would never match. Stripping makes both "jkrowling".
+function Get-MatchKey {
+    param([string]$Name)
+    if (-not $Name) { return '' }
+    return ($Name.ToLowerInvariant() -replace '[^a-z0-9]', '')
+}
+
+function Get-AudioCount {
+    param([string]$Path)
+    return @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Extension -in '.m4b', '.mp3', '.m4a' }).Count
+}
+
+function Build-LibraryIndex {
+    param([object[]]$Categories)
+
+    $seriesIndex = @{}   # "authorkey|serieskey" -> where that series lives
+    $authorIndex = @{}   # "authorkey"           -> @{ category name = book count }
+    $authorDirs  = @{}   # "authorkey"           -> @{ category name = real folder path }
+
+    foreach ($cat in $Categories) {
+        foreach ($author in @(Get-ChildItem -LiteralPath $cat.FullName -Directory -ErrorAction SilentlyContinue)) {
+            $aKey = Get-MatchKey $author.Name
+            if (-not $authorIndex.ContainsKey($aKey)) { $authorIndex[$aKey] = @{} }
+            if (-not $authorDirs.ContainsKey($aKey))  { $authorDirs[$aKey]  = @{} }
+
+            # Remember the folder's real spelling. A new download may spell the
+            # author differently ("JK Rowling" vs "J.K. Rowling"); we file it
+            # under the name already on disk instead of making a second folder.
+            if (-not $authorDirs[$aKey].ContainsKey($cat.Name)) {
+                $authorDirs[$aKey][$cat.Name] = $author.FullName
+            }
+
+            $n = Get-AudioCount $author.FullName
+            if ($authorIndex[$aKey].ContainsKey($cat.Name)) { $authorIndex[$aKey][$cat.Name] += $n }
+            else { $authorIndex[$aKey][$cat.Name] = $n }
+
+            foreach ($series in @(Get-ChildItem -LiteralPath $author.FullName -Directory -ErrorAction SilentlyContinue)) {
+                $key   = "$aKey|" + (Get-MatchKey $series.Name)
+                $count = Get-AudioCount $series.FullName
+                # A series split across categories (it happens) resolves to
+                # wherever most of it already lives, so stragglers rejoin the
+                # bulk of the series rather than the other way round.
+                if ((-not $seriesIndex.ContainsKey($key)) -or ($count -gt $seriesIndex[$key].Books)) {
+                    $seriesIndex[$key] = [pscustomobject]@{
+                        Category = $cat.Name
+                        Path     = $series.FullName
+                        Books    = $count
+                    }
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{ Series = $seriesIndex; Authors = $authorIndex; AuthorDirs = $authorDirs }
+}
+
+# Where this author's folder already lives in $Category, or $null if the
+# author is new there. Keeps one folder per author instead of near-duplicates.
+function Get-ExistingAuthorDir {
+    param($Index, [string]$AuthorName, [string]$Category)
+    $aKey = Get-MatchKey $AuthorName
+    if ($Index.AuthorDirs.ContainsKey($aKey) -and $Index.AuthorDirs[$aKey].ContainsKey($Category)) {
+        return $Index.AuthorDirs[$aKey][$Category]
+    }
+    return $null
+}
+
+# The author's categories, busiest first. $null when the author is new.
+function Get-AuthorHistory {
+    param($Index, [string]$AuthorName)
+    $aKey = Get-MatchKey $AuthorName
+    if (-not $Index.Authors.ContainsKey($aKey)) { return $null }
+    return @($Index.Authors[$aKey].GetEnumerator() | Sort-Object -Property Value -Descending)
+}
+
+# ==================================================================
 # Libation discovery
 #   <install>\appsettings.json  ->  "LibationFiles"  ->  <cfg>\Settings.json
 # ==================================================================
@@ -577,9 +674,45 @@ else {
         Write-Host "  Nothing to sort - every author folder is already categorized." -ForegroundColor Green
     }
     else {
-        Write-Host "  $($loose.Count) new author folder(s) need a category.`n" -ForegroundColor Yellow
+        Write-Host "  Indexing existing library..." -ForegroundColor DarkGray
+        $index = Build-LibraryIndex -Categories $categories
+        Write-Host "  $($index.Series.Count) known series, $($index.Authors.Count) known authors." -ForegroundColor DarkGray
+        Write-Host "  $($loose.Count) new author folder(s) to place.`n" -ForegroundColor Yellow
 
         foreach ($folder in $loose) {
+            $aKey       = Get-MatchKey $folder.Name
+            $seriesDirs = @(Get-ChildItem -LiteralPath $folder.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name)
+            $looseFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -ErrorAction SilentlyContinue)
+
+            # --- build the placement plan, one entry per series -----------
+            $plan = @()
+            foreach ($s in $seriesDirs) {
+                $key = "$aKey|" + (Get-MatchKey $s.Name)
+                if ($index.Series.ContainsKey($key)) {
+                    $hit = $index.Series[$key]
+                    # Dest is the series folder already on disk, so the books
+                    # join it even when this download spells things differently.
+                    $plan += [pscustomobject]@{
+                        Label = $s.Name; Source = $s.FullName; IsDir = $true
+                        Category = $hit.Category; Matched = $true; Dest = $hit.Path
+                        Note = "matched existing series ($($hit.Books) book(s) there)"
+                    }
+                }
+                else {
+                    $plan += [pscustomobject]@{
+                        Label = $s.Name; Source = $s.FullName; IsDir = $true
+                        Category = $null; Matched = $false; Dest = $null; Note = "new series"
+                    }
+                }
+            }
+            if ($looseFiles.Count -gt 0) {
+                $plan += [pscustomobject]@{
+                    Label = "$($looseFiles.Count) file(s) not in a series"; Source = $null; IsDir = $false
+                    Category = $null; Matched = $false; Dest = $null; Note = ""
+                }
+            }
+            if ($plan.Count -eq 0) { continue }   # empty folder, nothing to do
+
             $books = @(Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
                          Where-Object { $_.Extension -in '.m4b', '.mp3', '.m4a' })
             $bytes = ($books | Measure-Object Length -Sum).Sum
@@ -587,43 +720,117 @@ else {
 
             Write-Host ("-" * 72) -ForegroundColor DarkGray
             Write-Host "  AUTHOR: $($folder.Name)" -ForegroundColor White
-            Write-Host "  $($books.Count) audio file(s), $(Format-Size $bytes)"
-            foreach ($b in ($books | Select-Object -First 6)) {
-                Write-Host "     - $($b.Name)" -ForegroundColor DarkGray
-            }
-            if ($books.Count -gt 6) { Write-Host "     ... and $($books.Count - 6) more" -ForegroundColor DarkGray }
+            Write-Host "  $($books.Count) audio file(s), $(Format-Size $bytes)`n"
 
-            Write-Host ""
-            for ($i = 0; $i -lt $categories.Count; $i++) {
-                Write-Host "     [$($i + 1)] $($categories[$i].Name)" -ForegroundColor Green
-            }
-            Write-Host "     [s] skip for now    [q] stop sorting" -ForegroundColor DarkGray
-
-            $choice = Read-Host "`n  Category"
-            if ($choice -eq 'q') { Write-Host "  Sorting stopped." -ForegroundColor Yellow; break }
-            if ($choice -eq 's' -or [string]::IsNullOrWhiteSpace($choice)) {
-                Write-Host "  Skipped." -ForegroundColor DarkGray; continue
+            foreach ($p in $plan) {
+                if ($p.Matched) {
+                    Write-Host ("     {0,-38} -> {1}" -f $p.Label, $p.Category) -ForegroundColor Green
+                    Write-Host ("     {0,-38}    {1}" -f '', $p.Note) -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Host ("     {0,-38} -> ?" -f $p.Label) -ForegroundColor Yellow
+                }
             }
 
-            $idx = 0
-            if (-not [int]::TryParse($choice, [ref]$idx) -or $idx -lt 1 -or $idx -gt $categories.Count) {
-                Write-Host "  Not a valid choice - skipped." -ForegroundColor Yellow; continue
+            # --- anything unmatched needs one decision --------------------
+            $undecided = @($plan | Where-Object { -not $_.Matched })
+            if ($undecided.Count -gt 0) {
+                $history = Get-AuthorHistory -Index $index -AuthorName $folder.Name
+                $suggest = $null
+                if ($history) {
+                    $suggest = $history[0].Key
+                    Write-Host "`n  This author already appears in:" -ForegroundColor Cyan
+                    foreach ($h in $history) { Write-Host "     $($h.Key)  ($($h.Value) book(s))" -ForegroundColor Cyan }
+                }
+                else {
+                    Write-Host "`n  New author - no history to go on." -ForegroundColor DarkGray
+                }
+
+                Write-Host ""
+                $defIdx = 0
+                for ($i = 0; $i -lt $categories.Count; $i++) {
+                    $mark = ''
+                    if ($suggest -and $categories[$i].Name -eq $suggest) {
+                        $mark = '   <- suggested'
+                        $defIdx = $i + 1
+                    }
+                    Write-Host "     [$($i + 1)] $($categories[$i].Name)$mark" -ForegroundColor Green
+                }
+                Write-Host "     [s] skip for now    [q] stop sorting" -ForegroundColor DarkGray
+
+                $prompt = if ($defIdx -gt 0) { "`n  Category for the items marked ? [$defIdx]" }
+                          else               { "`n  Category for the items marked ?" }
+                $choice = Read-Host $prompt
+
+                if ($choice -eq 'q') { Write-Host "  Sorting stopped." -ForegroundColor Yellow; break }
+                if ($choice -eq 's') { Write-Host "  Skipped." -ForegroundColor DarkGray; continue }
+                if ([string]::IsNullOrWhiteSpace($choice)) {
+                    if ($defIdx -eq 0) { Write-Host "  No suggestion to accept - skipped." -ForegroundColor Yellow; continue }
+                    $choice = "$defIdx"     # bare Enter accepts the suggestion
+                }
+
+                $idx = 0
+                if (-not [int]::TryParse($choice, [ref]$idx) -or $idx -lt 1 -or $idx -gt $categories.Count) {
+                    Write-Host "  Not a valid choice - skipped." -ForegroundColor Yellow; continue
+                }
+                foreach ($p in $undecided) { $p.Category = $categories[$idx - 1].Name }
             }
 
-            $target = Join-Path $categories[$idx - 1].FullName $folder.Name
-            if ($DryRun) {
-                Write-Host "  [DRY RUN] would move -> $target" -ForegroundColor Yellow
-            }
-            else {
+            # --- apply -----------------------------------------------------
+            $failed = $false
+            foreach ($p in $plan) {
+                $catDir = ($categories | Where-Object { $_.Name -eq $p.Category } | Select-Object -First 1)
+                if (-not $catDir) { $failed = $true; continue }
+
+                # Prefer the author folder already on disk in this category over
+                # this download's spelling of the name.
+                $authorDir = Get-ExistingAuthorDir -Index $index -AuthorName $folder.Name -Category $p.Category
+                if (-not $authorDir) { $authorDir = Join-Path $catDir.FullName $folder.Name }
+
+                # Matched series go into the exact folder they matched; anything
+                # else goes under the author folder using its own name.
+                $dest = $p.Dest
+                if (-not $dest -and $p.IsDir) { $dest = Join-Path $authorDir (Split-Path $p.Source -Leaf) }
+
+                if ($DryRun) {
+                    $shown = if ($p.IsDir) { $dest } else { $authorDir }
+                    Write-Host "  [DRY RUN] $($p.Label)  ->  $($shown.Replace($LibationRoot + '\', ''))" -ForegroundColor Yellow
+                    continue
+                }
                 try {
-                    Move-Merge -Src $folder.FullName -Dst $target
-                    Write-Host "  Moved -> $($categories[$idx - 1].Name)\$($folder.Name)" -ForegroundColor Green
-                    Write-Log "SORTED: $($folder.Name) -> $($categories[$idx - 1].Name)"
+                    # The author folder may not exist in this category yet, and
+                    # Move-Item will not create missing parents for us.
+                    if (-not (Test-Path -LiteralPath $authorDir)) {
+                        New-Item -ItemType Directory -Path $authorDir -Force | Out-Null
+                    }
+                    if ($p.IsDir) {
+                        Move-Merge -Src $p.Source -Dst $dest
+                    }
+                    else {
+                        foreach ($f in $looseFiles) {
+                            $t = Join-Path $authorDir $f.Name
+                            if (Test-Path -LiteralPath $t) {
+                                Write-Host "      ! already exists, left in place: $($f.Name)" -ForegroundColor Yellow
+                                Write-Log "COLLISION (not moved): $($f.FullName)"
+                            }
+                            else { Move-Item -LiteralPath $f.FullName -Destination $t }
+                        }
+                    }
+                    Write-Host "  Placed: $($p.Label)  ->  $($p.Category)" -ForegroundColor Green
+                    Write-Log "SORTED: $($folder.Name) / $($p.Label) -> $($p.Category)"
                     $sorted++
                 }
                 catch {
-                    Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
-                    Write-Log "SORT FAILED: $($folder.Name) :: $($_.Exception.Message)"
+                    $failed = $true
+                    Write-Host "  FAILED: $($p.Label) :: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Log "SORT FAILED: $($folder.Name) / $($p.Label) :: $($_.Exception.Message)"
+                }
+            }
+
+            # Drop the now-empty author folder left behind at the root.
+            if (-not $DryRun -and -not $failed -and (Test-Path -LiteralPath $folder.FullName)) {
+                if (-not (Get-ChildItem -LiteralPath $folder.FullName -Force)) {
+                    Remove-Item -LiteralPath $folder.FullName -Force
                 }
             }
         }
@@ -699,7 +906,7 @@ if ($toUpload.Count -gt 0 -or $differing.Count -gt 0) {
 # STEP 4 - alerts + summary
 # ==================================================================
 Write-Head "SUMMARY" 'Cyan'
-Write-Host "  Author folders sorted : $sorted"
+Write-Host "  Items placed          : $sorted"
 Write-Host "  Files uploaded        : $(if ($uploadRan) { $toUpload.Count } else { 0 })"
 Write-Host "  Log                   : $LogFile"
 

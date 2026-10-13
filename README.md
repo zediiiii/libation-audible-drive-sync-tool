@@ -119,6 +119,53 @@ category and offered in the sort menu. The defaults are `01 - Kids`,
 `02 - Young Adult`, `03 - General`; add `04 - Nonfiction` and it appears
 automatically, no code change needed.
 
+## How placement decides
+
+Before sorting, the tool indexes every author and series already in the
+library. Each series inside a new download is then placed **independently**,
+so one download can split correctly across categories.
+
+**Series match — automatic.** If the author already has that series filed
+somewhere, the new books go there, no prompt. Books rejoin the category where
+most of the series already lives, so a straggler moves to the bulk rather than
+the other way round.
+
+**Author match — a suggestion only.** If the author is known but the series is
+new, the tool shows where that author already appears and pre-selects the
+busiest category. Press Enter to accept, or type a different number. It never
+decides on its own, because authors legitimately span categories — Drew Hayes
+writes both YA and adult series.
+
+**New author — plain prompt,** no default.
+
+Matching ignores case, punctuation and spacing, so `JK Rowling` files into the
+existing `J.K. Rowling`, and `harry potter` joins `Harry Potter`. Books are
+moved into the folder **already on disk**, using its spelling, so a differently
+spelled download never creates a second folder for the same author or series.
+
+```
+  AUTHOR: Drew Hayes
+
+     Brand New Saga                         -> ?
+     Roverpowered                           -> 02 - Young Adult
+                                               matched existing series (2 book(s) there)
+
+  This author already appears in:
+     02 - Young Adult  (2 book(s))
+     03 - General  (1 book(s))
+
+     [1] 01 - Kids
+     [2] 02 - Young Adult   <- suggested
+     [3] 03 - General
+```
+
+### What it does not do
+
+It only places **new downloads sitting loose at the root**. It will not
+reorganise books already filed inside a category, so a series that got split
+across two categories in the past stays split until you move it by hand. Once
+moved, future books in that series follow it automatically.
+
 ## Notes
 
 - Replaced an older FreeFileSync **Mirror** job, which was unsafe here: Mirror
